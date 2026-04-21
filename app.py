@@ -2,16 +2,19 @@
 Swin2-MoSE FastAPI sidecar.
 
 GPL-v2 isolated: this image runs the upstream IMPLabUniPr/swin2-mose model
-(once vendored) and exposes /predict, /health, /warmup over HTTP. The
-Taqneen Flask backend calls this via services/swin2_client.py.
+(vendored at /app/swin2_mose_upstream via Dockerfile pin to the v1.0 commit
+SHA) and exposes /predict, /health, /warmup over HTTP. Proprietary LCM
+applications call this sidecar only over HTTP.
 
-Phase 1 status:
-    The real Swin2-MoSE model is TODO until the GPL-v2 written-offer landing
-    page is approved by ministry legal (docs/phase0/gpl-written-offer.md).
-    Until then, the sidecar runs a deterministic bicubic upscale that
-    exercises the full pipeline contract (inputs, outputs, provenance fields)
-    end-to-end. Callers can flip MODEL_MODE=real once the upstream repo is
-    vendored + weights present at /app/weights/.
+Modes:
+    MODEL_MODE=placeholder (default)
+        Deterministic bicubic upscale via rasterio. Exercises the full
+        pipeline contract (inputs, outputs, provenance fields) end-to-end
+        without loading any GPL-v2 code.
+    MODEL_MODE=real
+        Real Swin2-MoSE inference. Requires the pretrained weights to be
+        extracted into /app/weights/ (see sidecars/swin2_mose/README.md and
+        docs/phase0/flip-to-real-procedure.md).
 """
 from __future__ import annotations
 
@@ -33,8 +36,14 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 MODEL_MODE = os.environ.get("MODEL_MODE", "placeholder").lower()   # placeholder | real
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "swin2_mose_placeholder_v0.1")
-WEIGHTS_PATH = os.environ.get("WEIGHTS_PATH", "/app/weights/sen2venus_x4.ckpt")
+# WEIGHTS_DIR holds an extracted upstream release (cfg.yml + checkpoints/*.pt).
+# For backwards compat, WEIGHTS_PATH is preserved and used for the SHA field
+# when it points at a file. The loader walks WEIGHTS_DIR to find cfg + ckpt.
+WEIGHTS_DIR = os.environ.get("WEIGHTS_DIR", "/app/weights")
+WEIGHTS_PATH = os.environ.get("WEIGHTS_PATH", "")
 SIDECAR_IMAGE_DIGEST = os.environ.get("SIDECAR_IMAGE_DIGEST", "unknown")
+TILE_SIZE = int(os.environ.get("SWIN2_TILE_SIZE", "128"))
+TILE_OVERLAP = int(os.environ.get("SWIN2_TILE_OVERLAP", "16"))
 
 # Preempt channel support (Redis pub/sub, optional)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://taqneen_redis:6379/0")
@@ -65,11 +74,12 @@ class PredictResponse(BaseModel):
 # ── Lazy model singleton ────────────────────────────────────────────────
 _model_lock = threading.Lock()
 _model = None  # placeholder mode keeps this None
+_ckpt_path_cached: str | None = None  # populated on first real-mode load
 
 
 def _load_model():
     """Load Swin2-MoSE weights lazily. No-op in placeholder mode."""
-    global _model
+    global _model, _ckpt_path_cached
     with _model_lock:
         if _model is not None:
             return _model
@@ -78,22 +88,33 @@ def _load_model():
             _model = "placeholder"
             return _model
 
-        # TODO(phase1): real model load once upstream is vendored.
-        # Example shape (commented until vendored):
-        # import torch
-        # from swin2_mose.model import load_checkpoint
-        # model = load_checkpoint(WEIGHTS_PATH)
-        # model.eval().to("cuda")
-        # _model = model
-        raise RuntimeError("MODEL_MODE=real requested but upstream not vendored yet")
+        import torch
+        from inference import build_and_load
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device.type == "cpu":
+            logger.warning(
+                "CUDA not available; running Swin2-MoSE on CPU. Inference will be slow."
+            )
+        model, cfg, ckpt_path = build_and_load(WEIGHTS_DIR, device)
+        _ckpt_path_cached = ckpt_path
+        _model = model
+        logger.info(
+            "Swin2-MoSE model loaded (device=%s, ckpt=%s, upstream_commit=%s)",
+            device, ckpt_path, os.environ.get("SWIN2_COMMIT", "unknown"),
+        )
+        return _model
 
 
 def _weights_sha() -> str:
-    """SHA-256 of the weights file (or placeholder for placeholder mode)."""
-    if MODEL_MODE != "real" or not os.path.exists(WEIGHTS_PATH):
-        return f"placeholder-v0.1-scale-agnostic"
+    """SHA-256 of the weights file (or placeholder marker for placeholder mode)."""
+    if MODEL_MODE != "real":
+        return "placeholder-v0.1-scale-agnostic"
+    path = _ckpt_path_cached or WEIGHTS_PATH
+    if not path or not os.path.exists(path):
+        return "real-weights-unknown"
     sha = hashlib.sha256()
-    with open(WEIGHTS_PATH, "rb") as f:
+    with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             sha.update(chunk)
     return sha.hexdigest()
@@ -128,11 +149,24 @@ def _infer_placeholder(input_path: str, output_path: str, scale: int) -> None:
 
 
 def _infer_real(input_path: str, output_path: str, scale: int) -> None:
-    """TODO(phase1): real Swin2-MoSE inference."""
-    raise NotImplementedError(
-        "Swin2-MoSE real inference is not wired yet. "
-        "Vendor IMPLabUniPr/swin2-mose, implement model load + forward pass, "
-        "then flip MODEL_MODE=real."
+    """Real Swin2-MoSE inference via the vendored upstream model."""
+    import torch
+    from inference import infer_to_geotiff
+
+    model = _model  # guaranteed loaded by _load_model()
+    if model is None or model == "placeholder":
+        raise RuntimeError(
+            "_infer_real called but model is not loaded in real mode"
+        )
+    device = next(model.parameters()).device
+    infer_to_geotiff(
+        model=model,
+        input_path=input_path,
+        output_path=output_path,
+        scale=scale,
+        device=device,
+        tile_size=TILE_SIZE,
+        overlap=TILE_OVERLAP,
     )
 
 

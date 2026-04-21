@@ -40,14 +40,25 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip && pip install -r /app/requirements.txt
 
-# TODO(phase1): clone and pin IMPLabUniPr/swin2-mose at a specific commit,
-# then install the library. Until legal sign-off completes, the sidecar runs
-# a bicubic-fallback placeholder that preserves the full pipeline contract.
-# RUN git clone --depth 1 https://github.com/IMPLabUniPr/swin2-mose.git \
-#     && cd swin2-mose && git checkout <pinned-sha> \
-#     && pip install -e .
+# Vendor IMPLabUniPr/swin2-mose at the v1.0 release commit. v1.0 is pinned
+# because it ships pretrained weights for both 2x and 4x Sen2Venus (v1.1
+# only re-trains the 2x task). The upstream repo has no setup.py, so we
+# clone source and expose it via PYTHONPATH rather than pip-installing it.
+#
+# The commit SHA is pinned (never a branch name) so rebuilds are byte-stable
+# and the source tarball attached to each GitHub Release on the public
+# mirror matches the exact binary.
+ARG SWIN2_COMMIT=5342a1c1d23791084dc7507df1faa209ce5b16ae
+RUN git clone --no-checkout https://github.com/IMPLabUniPr/swin2-mose.git /app/swin2_mose_upstream \
+    && cd /app/swin2_mose_upstream \
+    && git checkout ${SWIN2_COMMIT} \
+    && rm -rf .git
+
+ENV PYTHONPATH="/app:/app/swin2_mose_upstream:/app/swin2_mose_upstream/src"
+ENV SWIN2_COMMIT=${SWIN2_COMMIT}
 
 COPY app.py /app/app.py
+COPY inference.py /app/inference.py
 
 # GPL-v2 source disclosure notice travels with every image so that LCM
 # (as the GPL-compliance party) and any recipient can see the offer

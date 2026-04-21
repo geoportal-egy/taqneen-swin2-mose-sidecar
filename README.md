@@ -1,13 +1,15 @@
 # taqneen-swin2-mose-sidecar
 
-GPL v2.0 super-resolution sidecar used by Taqneen (a land-survey
-platform operated by **Land Connectivity Matrix ("LCM")**) for
-Sentinel-2 imagery enhancement.
+GPL v2.0 super-resolution sidecar operated by
+**Land Connectivity Matrix ("LCM")** for use inside LCM's commercial
+software systems, for Sentinel-2 imagery enhancement.
 
 This is LCM's maintained fork of
-[IMPLabUniPr/swin2-mose](https://github.com/IMPLabUniPr/swin2-mose).
-LCM adds a FastAPI serving wrapper, a Dockerfile, and integration with
-the Taqneen platform over a strict HTTP-only boundary.
+[IMPLabUniPr/swin2-mose](https://github.com/IMPLabUniPr/swin2-mose),
+pinned at the upstream v1.0 commit
+`5342a1c1d23791084dc7507df1faa209ce5b16ae`. LCM adds a FastAPI serving
+wrapper, a Dockerfile, tiled GeoTIFF inference, and integration with LCM
+applications over a strict HTTP-only boundary.
 
 ## License
 
@@ -26,14 +28,22 @@ commitment), see [`WRITTEN_OFFER.md`](WRITTEN_OFFER.md).
 
 ## LCM modifications
 
-- FastAPI serving wrapper (`app.py`): HTTP endpoints `/health`,
-  `/warmup`, `/predict`.
-- Dockerfile (CUDA 12.4 runtime base) for containerized deployment.
+- FastAPI serving wrapper (`app.py`): HTTP endpoints `/health`, `/warmup`,
+  `/predict`.
+- Tiled GeoTIFF inference (`inference.py`): model loading from a weights
+  directory, half-cosine overlap blending for seamless stitching, and
+  GeoTIFF I/O with CRS preservation.
+- Dockerfile (CUDA 12.4 runtime base) that git-clones the upstream repo
+  at the pinned commit and exposes it via `PYTHONPATH`.
 - Integration-specific environment variables.
-- Placeholder mode (`MODEL_MODE=placeholder`): deterministic bicubic
-  upscale via rasterio, used for pipeline testing without vendoring
-  upstream weights. Real mode (`MODEL_MODE=real`) will be activated
-  once LCM vendors the upstream repository at a pinned commit.
+- Two modes:
+  - **`MODEL_MODE=placeholder`** (default): deterministic bicubic upscale
+    via rasterio, used for pipeline testing without loading GPL-v2 code
+    at runtime.
+  - **`MODEL_MODE=real`**: real Swin2-MoSE inference on GPU. Requires
+    pretrained weights extracted under `WEIGHTS_DIR`.
+- Helper script `download_weights.sh` for fetching the upstream release
+  zip (`sen2venus_exp4_{2,4}x_v5.zip`).
 
 ## Build
 
@@ -44,8 +54,16 @@ docker build -t taqneen_swin2_mose:dev .
 ## Run
 
 ```bash
+# Placeholder mode (no weights needed):
 docker run --rm -p 8801:8801 \
   -e MODEL_MODE=placeholder \
+  taqneen_swin2_mose:dev
+
+# Real mode (weights mounted under /app/weights):
+docker run --rm --gpus all -p 8801:8801 \
+  -v /path/to/weights:/app/weights \
+  -e MODEL_MODE=real \
+  -e MODEL_VERSION=swin2_mose_sen2venus_x4_v1.0 \
   taqneen_swin2_mose:dev
 ```
 
@@ -62,22 +80,23 @@ docker run --rm -p 8801:8801 \
 | Variable                | Default                                     | Purpose |
 |-------------------------|---------------------------------------------|---------|
 | `MODEL_MODE`            | `placeholder`                               | `placeholder` or `real` |
-| `MODEL_VERSION`         | `swin2_mose_placeholder_v0.1`               | Surfaced in provenance |
-| `WEIGHTS_PATH`          | `/app/weights/sen2venus_x4.ckpt`            | Only used when `MODEL_MODE=real` |
+| `MODEL_VERSION`         | `swin2_mose_placeholder_v0.1`               | Surfaced in provenance. MUST NOT contain "placeholder" in real mode. |
+| `WEIGHTS_DIR`           | `/app/weights`                              | Loader walks this for `cfg.yml` + `checkpoints/model-*.pt` |
+| `SWIN2_TILE_SIZE`       | `128`                                       | Input-space tile size in pixels |
+| `SWIN2_TILE_OVERLAP`    | `16`                                        | Pixels of overlap between adjacent tiles (half-cosine blended) |
 | `SIDECAR_IMAGE_DIGEST`  | `unknown`                                   | Set at deploy to `sha256:<digest>` |
-| `REDIS_URL`             | `redis://taqneen_redis:6379/0`              | Preempt channel |
 
-## Relationship to the Taqneen platform
+## Relationship to LCM's proprietary software
 
-The Taqneen platform itself (Flask backend, React frontend, database,
-and everything else that *calls* this sidecar) is **not** part of this
-repository and is **not** licensed under GPL v2.0. Taqneen is
-proprietary, closed-source, all rights reserved, owned by LCM.
+The LCM platforms that call this sidecar (Flask backends, React
+frontends, databases, and everything else) are **not** part of this
+repository and are **not** licensed under GPL v2.0. They are proprietary,
+closed-source, all rights reserved, owned by LCM.
 
-This sidecar is invoked by Taqneen only over HTTP. No GPL code crosses
-the HTTP boundary into Taqneen, and no Taqneen code crosses into this
-sidecar. The process-level boundary is what keeps the licensing
-separation clean.
+Those LCM platforms invoke this sidecar only over HTTP. No GPL code
+crosses the HTTP boundary into any LCM platform, and no proprietary LCM
+code crosses into this sidecar. The process-level boundary is what keeps
+the licensing separation clean.
 
 ## Contact
 

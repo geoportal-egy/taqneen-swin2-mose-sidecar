@@ -17,7 +17,9 @@
 # Pin by digest in docker-compose.production.yml (never by tag), so result
 # rows can be audited against the exact image that produced them.
 
-ARG CUDA_IMAGE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+# CUDA 12.8 is the first base with Blackwell (sm_120) support, required for
+# RTX 50-series / H200 GPUs. Pairs with the cu128 torch wheels installed below.
+ARG CUDA_IMAGE=nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
 FROM ${CUDA_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -38,7 +40,13 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --upgrade pip && pip install -r /app/requirements.txt
+# torch is installed from the cu128 wheel index to get Blackwell-ready
+# CUDA kernels. Other deps install from PyPI default. The --extra-index-url
+# lets pip fall back to PyPI for packages not on the torch index.
+RUN python -m pip install --upgrade pip && \
+    pip install \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        -r /app/requirements.txt
 
 # Vendor IMPLabUniPr/swin2-mose at the v1.0 release commit. v1.0 is pinned
 # because it ships pretrained weights for both 2x and 4x Sen2Venus (v1.1

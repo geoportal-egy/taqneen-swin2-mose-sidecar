@@ -36,14 +36,17 @@ for _p in (UPSTREAM_ROOT, os.path.join(UPSTREAM_ROOT, "src")):
         sys.path.insert(0, _p)
 
 
-# Swin2MoSE.__init__ accepts these kwargs (see upstream swin2_mose_model/model.py).
-KNOWN_MODEL_KWARGS = frozenset({
-    "img_size", "patch_size", "in_chans", "embed_dim", "depths", "num_heads",
-    "window_size", "mlp_ratio", "qkv_bias", "drop_rate", "attn_drop_rate",
-    "drop_path_rate", "ape", "patch_norm", "use_checkpoint", "upscale",
-    "img_range", "upsampler", "resi_connection", "use_lepe", "use_cpb_bias",
-    "MoE_config", "use_rpe_bias",
-})
+# Upstream super_res.model.build_model dispatches on cfg.super_res.version:
+#   v1      -> super_res.network_swinir.SwinIR
+#   v2      -> super_res.network_swin2sr.Swin2SR   (what the Sen2Venus weights use)
+#   swinfir -> super_res.swinfir_arch.SwinFIR
+# The Swin2-MoSE checkpoint on v1.0 release is a Swin2SR with MoE enabled
+# via MoE_config in the model kwargs (see cfg.super_res.model).
+_SR_MODEL_IMPORTS = {
+    "v1": ("super_res.network_swinir", "SwinIR"),
+    "v2": ("super_res.network_swin2sr", "Swin2SR"),
+    "swinfir": ("super_res.swinfir_arch", "SwinFIR"),
+}
 
 
 def discover_weights(weights_dir: str) -> Tuple[str, str]:
@@ -74,57 +77,68 @@ def discover_weights(weights_dir: str) -> Tuple[str, str]:
     return cfg_path, ckpt_path
 
 
-def _extract_model_kwargs(cfg: dict) -> dict:
-    """Pull Swin2MoSE constructor kwargs out of a cfg dict.
-
-    Upstream puts model params under cfg['generator'] for SRGAN-style configs.
-    We check a few canonical keys, and filter to only the kwargs Swin2MoSE
-    actually accepts (to avoid accidental upstream-private keys).
-    """
-    candidates = [
-        cfg.get("generator"),
-        cfg.get("model"),
-        cfg.get("swin2_mose"),
-        cfg,
-    ]
-    for c in candidates:
-        if not isinstance(c, dict):
-            continue
-        kwargs = {k: v for k, v in c.items() if k in KNOWN_MODEL_KWARGS}
-        # heuristic: a real Swin2MoSE config will always carry at least upscale
-        # and embed_dim, so we use them to decide we found the right section
-        if "upscale" in kwargs and "embed_dim" in kwargs:
-            return kwargs
-    raise ValueError(
-        "Could not locate Swin2MoSE model kwargs in cfg.yml. Inspect the file "
-        "and, if the model section has a non-standard name, update "
-        "inference._extract_model_kwargs to check it."
-    )
-
-
 def build_model(cfg_path: str):
-    """Load cfg.yml, import Swin2MoSE from vendored upstream, instantiate."""
+    """Load cfg.yml, import the upstream SR model class, instantiate.
+
+    The upstream v1.0 layout places code under `src/super_res/`:
+      - `model.py` has a `build_model(cfg)` factory dispatching on
+        `cfg.super_res.version`.
+      - The actual classes live in `network_swinir.py`, `network_swin2sr.py`,
+        and `swinfir_arch.py`.
+    We replicate the factory's dispatch here (rather than importing it) so
+    that we control the device placement separately and do not depend on
+    the cfg having a `device` attribute.
+    """
     # Upstream serializes cfg.yml with Python tags (!!python/object/new:easydict.EasyDict).
     # SafeLoader rejects these; unsafe_load handles them by calling the
-    # easydict constructor. Acceptable because the cfg.yml comes directly
-    # from the upstream GPL-v2 release zip fetched by download_weights.sh
-    # (no arbitrary third-party YAML is passed through here).
+    # easydict constructor. Acceptable because cfg.yml comes directly from
+    # the upstream GPL-v2 release zip fetched by download_weights.sh (no
+    # third-party YAML is passed through this code path).
     with open(cfg_path, "r") as f:
         cfg = yaml.unsafe_load(f)
 
+    sr = getattr(cfg, "super_res", None)
+    if sr is None and isinstance(cfg, dict):
+        sr = cfg.get("super_res")
+    if sr is None:
+        raise ValueError(
+            "cfg.yml is missing the 'super_res' section. Expected upstream "
+            "v1.0 layout with cfg.super_res.version + cfg.super_res.model."
+        )
+
+    version = getattr(sr, "version", None) or (sr.get("version") if hasattr(sr, "get") else None) or "v1"
+    model_cfg = getattr(sr, "model", None) or (sr.get("model") if hasattr(sr, "get") else None)
+    if model_cfg is None:
+        raise ValueError(
+            f"cfg.super_res.model is missing. Cannot instantiate SR model "
+            f"for version {version!r}."
+        )
+
+    if version not in _SR_MODEL_IMPORTS:
+        raise ValueError(
+            f"Unknown cfg.super_res.version: {version!r}. "
+            f"Expected one of {sorted(_SR_MODEL_IMPORTS)}."
+        )
+
+    module_name, class_name = _SR_MODEL_IMPORTS[version]
     try:
-        from swin2_mose_model.model import Swin2MoSE  # type: ignore
-    except ImportError as exc:
+        module = __import__(module_name, fromlist=[class_name])
+        SRModel = getattr(module, class_name)
+    except (ImportError, AttributeError) as exc:
         raise RuntimeError(
-            f"Cannot import swin2_mose_model.model.Swin2MoSE. "
+            f"Cannot import {module_name}.{class_name}. "
             f"Verify the upstream repo is vendored at {UPSTREAM_ROOT!r} "
-            f"(Dockerfile should git clone + checkout the pinned SWIN2_COMMIT). "
-            f"Error: {exc}"
+            f"and sys.path includes its src/ directory. Error: {exc}"
         ) from exc
 
-    kwargs = _extract_model_kwargs(cfg)
-    logger.info("Instantiating Swin2MoSE with kwargs: %s", kwargs)
-    model = Swin2MoSE(**kwargs)
+    # Convert the EasyDict/dict to a plain dict for **kwargs expansion.
+    kwargs = dict(model_cfg)
+    logger.info(
+        "Instantiating %s (cfg.super_res.version=%s) with %d kwargs: upscale=%s, embed_dim=%s, upsampler=%s",
+        class_name, version, len(kwargs),
+        kwargs.get("upscale"), kwargs.get("embed_dim"), kwargs.get("upsampler"),
+    )
+    model = SRModel(**kwargs)
     return model, cfg
 
 

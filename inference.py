@@ -104,8 +104,13 @@ def _extract_model_kwargs(cfg: dict) -> dict:
 
 def build_model(cfg_path: str):
     """Load cfg.yml, import Swin2MoSE from vendored upstream, instantiate."""
+    # Upstream serializes cfg.yml with Python tags (!!python/object/new:easydict.EasyDict).
+    # SafeLoader rejects these; unsafe_load handles them by calling the
+    # easydict constructor. Acceptable because the cfg.yml comes directly
+    # from the upstream GPL-v2 release zip fetched by download_weights.sh
+    # (no arbitrary third-party YAML is passed through here).
     with open(cfg_path, "r") as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.unsafe_load(f)
 
     try:
         from swin2_mose_model.model import Swin2MoSE  # type: ignore

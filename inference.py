@@ -315,6 +315,13 @@ def infer_to_geotiff(
 
     x = arr.astype(np.float32)
 
+    # Track the rescale factor used for normalization so we can invert it
+    # on the output. Without this the model produces values in ~[0, 1]
+    # (its training range) but the caller expects them in the original
+    # uint16 reflectance space. Skipping the inverse-scale step would
+    # clip every pixel to 0 after the uint16 cast below.
+    scale_factor: Optional[float] = None
+
     if band_mean is not None and band_std is not None:
         if len(band_mean) != x.shape[0] or len(band_std) != x.shape[0]:
             raise ValueError(
@@ -325,7 +332,8 @@ def infer_to_geotiff(
             x[i] = (x[i] - band_mean[i]) / max(float(band_std[i]), 1e-6)
     elif x.max() > 1.0:
         # Default to per-image scale to [0, 1] if no normalization provided.
-        x = x / max(x.max(), 1e-6)
+        scale_factor = float(max(x.max(), 1e-6))
+        x = x / scale_factor
 
     tensor = torch.from_numpy(x).unsqueeze(0).to(device)
     logger.info(
@@ -334,6 +342,9 @@ def infer_to_geotiff(
     )
     out = tiled_inference(model, tensor, scale=scale, tile_size=tile_size, overlap=overlap)
     out_np = out.squeeze(0).cpu().numpy()
+
+    if scale_factor is not None:
+        out_np = out_np * scale_factor
 
     if band_mean is not None and band_std is not None:
         for i in range(out_np.shape[0]):

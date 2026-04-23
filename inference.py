@@ -235,8 +235,20 @@ def tiled_inference(model, x_tensor, scale: int, tile_size: int = 128, overlap: 
                 pad_b = tile_size - th_in
                 pad_r = tile_size - tw_in
                 if pad_b > 0 or pad_r > 0:
+                    # torch's reflect padding requires pad < dim. When the
+                    # input is smaller than tile_size (e.g. a parcel-sized
+                    # bbox returns ~20-40px from Sentinel-2), reflect mode
+                    # raises:
+                    #   RuntimeError: Padding size should be less than the
+                    #   corresponding input dimension
+                    # Use reflect only when safe, otherwise fall back to
+                    # replicate (edge-replicate) which has no size constraint
+                    # and produces visually similar results at the padded
+                    # border (the border gets cropped off the output anyway).
+                    can_reflect = pad_r < tw_in and pad_b < th_in
+                    mode = "reflect" if can_reflect else "replicate"
                     tile_in = torch.nn.functional.pad(
-                        tile_in, (0, pad_r, 0, pad_b), mode="reflect"
+                        tile_in, (0, pad_r, 0, pad_b), mode=mode
                     )
 
                 out = model(tile_in)
